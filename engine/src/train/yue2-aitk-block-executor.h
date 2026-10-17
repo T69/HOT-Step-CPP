@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -96,6 +97,14 @@ inline ggml_tensor * make_mask(ggml_context * ctx, int64_t sequence, int64_t pre
 }
 // make_mask's rule as the attention op's causal hint: key j is visible iff
 // j <= hint + row (noncausal: every key, so any hint >= keys - 1).
+// NAR attention sees every key: build it without a mask and hint (YUE2_AITK_NAR_NOMASK=0 restores the old graph).
+// Metal only: its attention backward takes the dS-materialisation path without a mask. CUDA's pipelined
+// kernels need the causal hint (fa_train_pipe_ok), so other backends keep the masked graph.
+inline bool nar_unmasked(Yue2AitkMaskMode mode, bool have_constants, ggml_backend_t backend) {
+    static const bool off = [] { const char * e = std::getenv("YUE2_AITK_NAR_NOMASK"); return e && *e == '0'; }();
+    const char * name = backend ? ggml_backend_name(backend) : nullptr;
+    return !off && have_constants && mode == Yue2AitkMaskMode::noncausal && name && std::strncmp(name, "MTL", 3) == 0;
+}
 inline int64_t causal_hint(Yue2AitkMaskMode mode, int64_t prefix, int64_t sequence) {
     return mode == Yue2AitkMaskMode::noncausal ? prefix + sequence : prefix;
 }
@@ -223,7 +232,7 @@ public:
         ggml_tensor * sin_t = constants ? constants->sine : ggml_new_tensor_4d(r.ctx, GGML_TYPE_F32, config.head_dim/2, 1, sequence, 1);
         std::vector<uint16_t> mask_data; ggml_tensor * mask = constants ? constants->mask : make_mask(r.ctx, sequence, prefix_length, mask_mode, &mask_data, error);
         if (!h || !cos_t || !sin_t || !mask) return fail(error, "forward tensor allocation failed");
-        Yue2AitkBlockResult out = yue2_aitk_graph::block(r.ctx, config, weights, norms, adapters, h, cos_t, sin_t, mask, prefix_k_canvas, prefix_v_canvas, prefix_length, causal_hint(mask_mode, prefix_length, sequence), constants ? constants->positions : nullptr);
+        Yue2AitkBlockResult out = yue2_aitk_graph::block(r.ctx, config, weights, norms, adapters, h, cos_t, sin_t, mask, prefix_k_canvas, prefix_v_canvas, prefix_length, causal_hint(mask_mode, prefix_length, sequence), constants ? constants->positions : nullptr, nullptr, nar_unmasked(mask_mode, constants != nullptr, backend));
         ggml_cgraph * graph = ggml_new_graph_custom(r.ctx, 32768, true); if (!graph) return fail(error, "forward graph allocation failed");
         ggml_tensor * key_cont = capture_kv && out.key ? ggml_cont(r.ctx, out.key) : nullptr;
         ggml_tensor * value_cont = capture_kv && out.value ? ggml_cont(r.ctx, out.value) : nullptr;
@@ -325,7 +334,7 @@ public:
         if (device_attn && !(device_attn->type == GGML_TYPE_F32 && ggml_is_contiguous(device_attn) && device_attn->data)) device_attn = nullptr;
         TensorFlagsGuard attn_flags(device_attn);
         ggml_set_param(h);
-        Yue2AitkBlockResult out=yue2_aitk_graph::block(r.ctx,config,weights,norms,adapters,h,cos_t,sin_t,mask,prefix_k_canvas,prefix_v_canvas,prefix_length,causal_hint(mask_mode,prefix_length,sequence),constants ? constants->positions : nullptr,device_attn);
+        Yue2AitkBlockResult out=yue2_aitk_graph::block(r.ctx,config,weights,norms,adapters,h,cos_t,sin_t,mask,prefix_k_canvas,prefix_v_canvas,prefix_length,causal_hint(mask_mode,prefix_length,sequence),constants ? constants->positions : nullptr,device_attn,nar_unmasked(mask_mode, constants != nullptr, backend));
         ggml_tensor * loss=ggml_sum(r.ctx,ggml_mul(r.ctx,out.hidden,upstream)); ggml_cgraph * graph=ggml_new_graph_custom(r.ctx,65536,true); if(!loss||!graph) return fail(error,"backward graph allocation failed");
         ggml_build_forward_expand(graph,loss); ggml_set_loss(loss);
         lap.mark("bwd: graph build");
